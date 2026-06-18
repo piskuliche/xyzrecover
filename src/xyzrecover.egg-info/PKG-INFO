@@ -1,3 +1,19 @@
+Metadata-Version: 2.4
+Name: xyzrecover
+Version: 0.1.0
+Summary: Recover RDKit molecules, charges, SMILES, InChI, and InChIKey from XYZ coordinates with candidate charge inference.
+Author: OpenAI ChatGPT
+License: MIT
+Keywords: rdkit,xyz,smiles,inchi,chemistry,bond perception
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Chemistry
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: rdkit>=2022.9
+
 # xyzrecover
 
 `xyzrecover` is a small RDKit-based package for recovering molecular identifiers from XYZ coordinate files when the bond graph and charge were lost.

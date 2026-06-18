@@ -1,0 +1,2 @@
+[console_scripts]
+xyzrecover = xyzrecover.cli:main
