@@ -9,18 +9,30 @@ description = "Recover RDKit molecules, charges, SMILES, InChI, and InChIKey fro
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name = "OpenAI ChatGPT"}]
+authors = [{email = "piskulichz@gmail.com"}]
 dependencies = [
   "rdkit>=2022.9"
 ]
 keywords = ["rdkit", "xyz", "smiles", "inchi", "chemistry", "bond perception"]
 classifiers = [
+  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Chemistry",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "ruff>=0.4",
+  "mypy>=1.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/piskuliche/xyzrecover"
+Repository = "https://github.com/piskuliche/xyzrecover"
 
 [project.scripts]
 xyzrecover = "xyzrecover.cli:main"
@@ -30,3 +42,24 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# Line length is owned by the formatter; do not also flag it in the linter.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+
+# RDKit ships its own stubs, but some versions contain a syntax error that
+# aborts type-checking. Skip following them; treat RDKit symbols as Any.
+[[tool.mypy.overrides]]
+module = "rdkit.*"
+follow_imports = "skip"
+ignore_missing_imports = true

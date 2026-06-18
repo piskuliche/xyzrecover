@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(python -c \"import rdkit; print\\('rdkit', rdkit.__version__\\)\")",
+      "Bash(ruff --version)",
+      "Bash(PYTHONPATH=src python -m pytest -q)",
+      "Bash(git -C /mnt/dat1/zeke/Project/Downloads/xyzrecover-0.1.0 status)",
+      "Bash(ruff check *)",
+      "Bash(ruff format *)"
+    ]
+  }
+}

@@ -24,6 +24,13 @@ conda install -c conda-forge rdkit
 python -m pip install -e .
 ```
 
+The package installs a `xyzrecover` console script; you can also run it as a
+module with `python -m xyzrecover`.
+
+> **Charge options apply to every block.** `--total-charge` and
+> `--per-fragment-charges` are applied to *every* XYZ block in *every* input
+> file. Use one charge state per invocation for heterogeneous batches.
+
 ## CLI examples
 
 Unknown charge, try charge states -3 through +3:
@@ -44,10 +51,19 @@ A salt or cluster with multiple disconnected components and known total charge:
 xyzrecover ion_pair.xyz --total-charge 0 --candidate-charges=-2,-1,0,1,2
 ```
 
-Known per-component charges after connectivity splitting:
+Known per-component charges. The order follows connectivity perception (the
+same order as `molecule_index` in the output, *not* the input atom order), so
+run once unconstrained first to see how the structure splits:
 
 ```bash
 xyzrecover fragments.xyz --per-fragment-charges=1,-1,0
+```
+
+If an asserted charge can't be satisfied for a component, fall back to the
+candidate charge search for that component instead of failing it:
+
+```bash
+xyzrecover molecule.xyz --total-charge 2 --charge-fallback
 ```
 
 Use extended Hueckel connectivity if your RDKit build supports YAeHMOP:
@@ -81,8 +97,18 @@ Each record contains:
 - `explicit_h_smiles`: canonical SMILES retaining explicit hydrogens from the XYZ
 - `inchi` and `inchikey`
 - `confidence`: `high`, `medium`, `low`, or `none`
+- `block_index` / `molecule_index`: which XYZ block (frame) and which recovered
+  component the record came from
+- `atom_indices`: indices into the source block's atoms for this component
 - `alternates`: other successful charge/bond-order assignments, when present
-- `errors`: failed charge attempts, useful for debugging
+- `warnings` / `errors`: notes and failed charge attempts, useful for debugging
+
+### Multi-frame XYZ
+
+Each XYZ block is processed independently, so a multi-frame file (e.g. a
+trajectory of one molecule) yields one set of records per frame, distinguished
+by `block_index`. De-duplicate on `inchikey` downstream if you only want unique
+species.
 
 ## Recommended workflow
 
@@ -91,8 +117,19 @@ Each record contains:
 3. For unusual bonding, radicals, metals, transition states, hypervalent species, or very close non-covalent contacts, validate against quantum chemistry output or another bond-perception method.
 4. Keep the SDF output because it preserves the recovered 3D coordinates and the inferred bond graph.
 
-## Tests
+## Development
+
+Install the dev extras (pytest, ruff, mypy) and run the checks:
 
 ```bash
-python -m pytest
+python -m pip install -e ".[dev]"
+python -m pytest        # tests
+ruff check .            # lint
+ruff format .           # format
 ```
+
+CI runs ruff (lint + format check) and pytest on Python 3.10–3.12.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

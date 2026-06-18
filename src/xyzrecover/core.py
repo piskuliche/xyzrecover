@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import copy
 import csv
 import itertools
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from rdkit import Chem, rdBase
-from rdkit.Chem import Descriptors, rdMolDescriptors
+from rdkit.Chem import Descriptors, rdDetermineBonds, rdMolDescriptors
 from rdkit.Chem import inchi as rd_inchi
-from rdkit.Chem import rdDetermineBonds
 
 
 class XyzRecoverError(RuntimeError):
@@ -30,9 +31,19 @@ class PerceptionConfig:
         constrained to sum to this value.
     per_fragment_charges
         Optional explicit charge per disconnected component. This overrides
-        `candidate_charges` for the corresponding components.
+        `candidate_charges` for the corresponding components. The order matches
+        the order in which connectivity perception discovers the components,
+        which is the same order as ``molecule_index`` in the returned records
+        (not necessarily the atom order in the input). Inspect a first
+        unconstrained run to see how a structure splits before relying on this.
     candidate_charges
         Charge states to try when a component charge is unknown.
+    charge_fallback
+        If True and a charge-constrained component (via `total_charge` for a
+        single component, or `per_fragment_charges`) yields no valid assignment,
+        retry that component using `candidate_charges`. The recovered record is
+        flagged with a warning. Default False, so an asserted charge that cannot
+        be satisfied fails loudly rather than silently guessing.
     split_fragments
         If True, split disconnected covalent components before assigning bond
         orders. This is recommended for XYZ files containing multiple molecules.
@@ -47,6 +58,9 @@ class PerceptionConfig:
         Covalent-radius multiplier used for connectivity perception.
     embed_chiral
         Ask RDKit to embed 3D-derived chirality while assigning bonds.
+    sanitize
+        Run ``Chem.SanitizeMol`` on each perceived candidate. A candidate that
+        fails sanitization is rejected. Applied independently of `embed_chiral`.
     keep_explicit_h_smiles
         If True, the primary SMILES retains explicit hydrogens from the XYZ.
         Otherwise, a conventional implicit-H canonical SMILES is generated when
@@ -60,6 +74,7 @@ class PerceptionConfig:
     total_charge: int | None = None
     per_fragment_charges: tuple[int, ...] | None = None
     candidate_charges: tuple[int, ...] = (-3, -2, -1, 0, 1, 2, 3)
+    charge_fallback: bool = False
     split_fragments: bool = True
     allow_charged_fragments: bool = True
     use_hueckel: bool = False
@@ -96,9 +111,15 @@ class MoleculeRecord:
     mol: Any | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self, include_mol: bool = False) -> dict[str, Any]:
-        data = asdict(self)
-        if not include_mol:
-            data.pop("mol", None)
+        # Build the dict directly from fields, deep-copying only the plain data.
+        # Using dataclasses.asdict here would deep-copy the RDKit Mol (an
+        # expensive, sometimes-failing operation) on every call, only to discard
+        # it. to_dict() runs once per record for JSON, CSV, and SDF output.
+        data = {
+            f.name: copy.deepcopy(getattr(self, f.name)) for f in fields(self) if f.name != "mol"
+        }
+        if include_mol:
+            data["mol"] = self.mol
         return data
 
 
@@ -229,7 +250,12 @@ def parse_xyz_blocks(text: str) -> list[str]:
             if len(with_comment) == n_atoms and all(_parse_atom_line(x) for x in with_comment):
                 atoms = [_parse_atom_line(x) for x in with_comment]
                 assert all(a is not None for a in atoms)
-                blocks.append(_format_xyz([a for a in atoms if a is not None], lines[i + 1] if i + 1 < len(lines) else ""))
+                blocks.append(
+                    _format_xyz(
+                        [a for a in atoms if a is not None],
+                        lines[i + 1] if i + 1 < len(lines) else "",
+                    )
+                )
                 i += n_atoms + 2
                 continue
             no_comment = lines[i + 1 : i + 1 + n_atoms]
@@ -309,8 +335,9 @@ def _manual_components(atoms: Sequence[_AtomRow], cov_factor: float) -> list[tup
     return [tuple(v) for v in groups.values()]
 
 
-def _split_components(block: str, config: PerceptionConfig) -> tuple[list[tuple[int, ...]], list[str]]:
-    atoms, _ = _atoms_from_xyz_block(block)
+def _split_components(
+    block: str, atoms: Sequence[_AtomRow], config: PerceptionConfig
+) -> tuple[list[tuple[int, ...]], list[str]]:
     warnings: list[str] = []
     if not config.split_fragments:
         return [tuple(range(len(atoms)))], warnings
@@ -337,10 +364,11 @@ def _split_components(block: str, config: PerceptionConfig) -> tuple[list[tuple[
     return _manual_components(atoms, config.cov_factor), warnings
 
 
-def _fragment_xyz(block: str, indices: Sequence[int], comment: str = "") -> tuple[str, list[str]]:
-    atoms, parent_comment = _atoms_from_xyz_block(block)
+def _fragment_xyz(
+    atoms: Sequence[_AtomRow], indices: Sequence[int], comment: str = ""
+) -> tuple[str, list[str]]:
     selected = [atoms[i] for i in indices]
-    frag_comment = comment or parent_comment or "fragment"
+    frag_comment = comment or "fragment"
     return _format_xyz(selected, frag_comment), [a.symbol for a in selected]
 
 
@@ -359,7 +387,9 @@ def _charge_search_order(charges: Iterable[int]) -> tuple[int, ...]:
     return tuple(sorted(_unique_ordered(charges), key=lambda x: (abs(x), x)))
 
 
-def _charges_for_fragment(config: PerceptionConfig, n_fragments: int, frag_index: int) -> tuple[int, ...]:
+def _charges_for_fragment(
+    config: PerceptionConfig, n_fragments: int, frag_index: int
+) -> tuple[int, ...]:
     if config.per_fragment_charges is not None:
         if frag_index >= len(config.per_fragment_charges):
             raise XyzRecoverError(
@@ -450,7 +480,9 @@ def _candidate_from_mol(mol: Chem.Mol, charge: int, config: PerceptionConfig) ->
     )
 
 
-def _perceive_candidates(fragment_block: str, charges: Sequence[int], config: PerceptionConfig) -> tuple[list[_Candidate], list[str]]:
+def _perceive_candidates(
+    fragment_block: str, charges: Sequence[int], config: PerceptionConfig
+) -> tuple[list[_Candidate], list[str]]:
     candidates: list[_Candidate] = []
     errors: list[str] = []
     use_hueckel = config.use_hueckel
@@ -472,7 +504,7 @@ def _perceive_candidates(fragment_block: str, charges: Sequence[int], config: Pe
                 useVdw=config.use_vdw,
                 maxIterations=int(config.max_iterations),
             )
-            if config.sanitize and not config.embed_chiral:
+            if config.sanitize:
                 Chem.SanitizeMol(mol)
             if mol.GetNumConformers():
                 try:
@@ -493,7 +525,9 @@ def _perceive_candidates(fragment_block: str, charges: Sequence[int], config: Pe
     return candidates, errors
 
 
-def _confidence(candidates: Sequence[_Candidate], chosen: _Candidate | None, charge_constrained: bool) -> str:
+def _confidence(
+    candidates: Sequence[_Candidate], chosen: _Candidate | None, charge_constrained: bool
+) -> str:
     if chosen is None:
         return "none"
     unique = {(c.charge, c.smiles, c.inchi) for c in candidates}
@@ -555,14 +589,14 @@ def _candidate_to_record(
             alternates=[],
             mol=None,
         )
-    alternates = [
-        _alternate_dict(alt)
-        for alt in candidates
-        if alt is not cand
-    ][: config.max_reported_alternates]
+    alternates = [_alternate_dict(alt) for alt in candidates if alt is not cand][
+        : config.max_reported_alternates
+    ]
     warnings = list(inherited_warnings) + list(cand.warnings)
     if alternates:
-        warnings.append("Alternative charge/bond-order assignments were possible; inspect alternates.")
+        warnings.append(
+            "Alternative charge/bond-order assignments were possible; inspect alternates."
+        )
     return MoleculeRecord(
         source=source,
         block_index=block_index,
@@ -585,7 +619,9 @@ def _candidate_to_record(
     )
 
 
-def _combine_scores(a: tuple[int | float, ...], b: tuple[int | float, ...]) -> tuple[int | float, ...]:
+def _combine_scores(
+    a: tuple[int | float, ...], b: tuple[int | float, ...]
+) -> tuple[int | float, ...]:
     return tuple(x + y for x, y in itertools.zip_longest(a, b, fillvalue=0))
 
 
@@ -594,7 +630,9 @@ def _choose_total_charge_combo(
 ) -> tuple[_Candidate, ...] | None:
     # Dynamic programming: for each running charge sum, keep the lowest-score combo.
     empty_score = (0, 0, 0, 0, 0, 0, 0.0)
-    states: dict[int, tuple[tuple[_Candidate, ...], tuple[int | float, ...]]] = {0: ((), empty_score)}
+    states: dict[int, tuple[tuple[_Candidate, ...], tuple[int | float, ...]]] = {
+        0: ((), empty_score)
+    }
     for cands in candidate_sets:
         next_states: dict[int, tuple[tuple[_Candidate, ...], tuple[int | float, ...]]] = {}
         for running_charge, (combo, score) in states.items():
@@ -624,7 +662,8 @@ def recover_xyz_block(
     if len(normal_blocks) != 1:
         raise XyzRecoverError("recover_xyz_block expects exactly one XYZ block")
     normal_block = normal_blocks[0]
-    component_indices, split_warnings = _split_components(normal_block, config)
+    atoms, _ = _atoms_from_xyz_block(normal_block)
+    component_indices, split_warnings = _split_components(normal_block, atoms, config)
     n_fragments = len(component_indices)
 
     if config.per_fragment_charges is not None and len(config.per_fragment_charges) != n_fragments:
@@ -638,12 +677,24 @@ def recover_xyz_block(
     fragment_blocks: list[str] = []
     for frag_idx, atom_indices in enumerate(component_indices):
         frag_block, elements = _fragment_xyz(
-            normal_block,
+            atoms,
             atom_indices,
             comment=f"{source or 'xyz'} block={block_index} fragment={frag_idx}",
         )
         charges = _charges_for_fragment(config, n_fragments, frag_idx)
         candidates, errors = _perceive_candidates(frag_block, charges, config)
+        if not candidates and config.charge_fallback:
+            extra_charges = tuple(
+                c for c in _charge_search_order(config.candidate_charges) if c not in charges
+            )
+            if extra_charges:
+                candidates, fb_errors = _perceive_candidates(frag_block, extra_charges, config)
+                errors = list(errors) + fb_errors
+                for cand in candidates:
+                    cand.warnings.append(
+                        "Charge-constrained perception failed; recovered using "
+                        "candidate_charges fallback."
+                    )
         candidate_sets.append(candidates)
         error_sets.append(errors)
         element_sets.append(elements)
@@ -695,7 +746,13 @@ def recover_xyz_text(
     *,
     source: str | None = None,
 ) -> list[MoleculeRecord]:
-    """Recover molecule records from text containing one or more XYZ blocks."""
+    """Recover molecule records from text containing one or more XYZ blocks.
+
+    Each XYZ block is treated independently, so a multi-frame file (e.g. a
+    trajectory of the same molecule) produces one set of records per frame,
+    distinguished by the ``block_index`` field. De-duplicate on ``inchikey``
+    downstream if you only want unique species.
+    """
     config = config or PerceptionConfig()
     records: list[MoleculeRecord] = []
     for block_index, block in enumerate(parse_xyz_blocks(text)):
@@ -703,7 +760,9 @@ def recover_xyz_text(
     return records
 
 
-def recover_xyz_file(path: str | Path, config: PerceptionConfig | None = None) -> list[MoleculeRecord]:
+def recover_xyz_file(
+    path: str | Path, config: PerceptionConfig | None = None
+) -> list[MoleculeRecord]:
     """Recover molecule records from an XYZ file."""
     path = Path(path)
     return recover_xyz_text(path.read_text(), config or PerceptionConfig(), source=str(path))
