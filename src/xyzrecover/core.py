@@ -13,10 +13,29 @@ from typing import Any
 from rdkit import Chem, rdBase
 from rdkit.Chem import Descriptors, rdDetermineBonds, rdMolDescriptors
 from rdkit.Chem import inchi as rd_inchi
+from rdkit.Geometry import Point3D
 
 
 class XyzRecoverError(RuntimeError):
     """Raised when XYZ parsing or molecule recovery cannot proceed."""
+
+
+# Main-group elements that RDKit's xyz2mol / DetermineBonds valence model can
+# handle. Anything outside this set (metals, noble gases, most of the periodic
+# table) is not reliably perceivable: RDKit may raise, or worse, silently return
+# a wrong structure at high confidence (e.g. a lone Na+ comes back as ``[NaH]``).
+# Such fragments are reported with status "unsupported" rather than perceived.
+DEFAULT_SUPPORTED_ELEMENTS: frozenset[str] = frozenset(
+    {"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "Se", "Br", "I"}
+)
+
+# Group 1 / group 2 metals have an unambiguous ionic oxidation state when they
+# appear as an isolated single-atom fragment (a counterion in a salt or ion
+# pair): alkali metals are +1, alkaline-earth metals are +2. These can be
+# recovered directly as their ion instead of being sent through RDKit (which
+# would mis-assign them, see DEFAULT_SUPPORTED_ELEMENTS).
+ALKALI_METALS: frozenset[str] = frozenset({"Li", "Na", "K", "Rb", "Cs", "Fr"})
+ALKALINE_EARTH_METALS: frozenset[str] = frozenset({"Be", "Mg", "Ca", "Sr", "Ba", "Ra"})
 
 
 @dataclass(frozen=True)
@@ -44,6 +63,23 @@ class PerceptionConfig:
         retry that component using `candidate_charges`. The recovered record is
         flagged with a warning. Default False, so an asserted charge that cannot
         be satisfied fails loudly rather than silently guessing.
+    restrict_to_supported_elements
+        If True (default), a component containing any element RDKit's xyz2mol
+        valence model cannot handle (metals, noble gases) is reported with
+        ``status="unsupported"`` and ``smiles=None`` instead of being perceived.
+        This prevents silent, high-confidence garbage such as a lone Na+ being
+        recovered as ``[NaH]``. Set False to attempt perception anyway.
+    supported_elements
+        The set of element symbols treated as supported. ``None`` uses
+        `DEFAULT_SUPPORTED_ELEMENTS`. Extend it if your RDKit build handles more.
+    recover_ionic_metals
+        If True (default), an isolated single-atom fragment of a group 1 or
+        group 2 metal (a salt/ion-pair counterion) is recovered directly as its
+        ion (``[Na+]``, ``[Ca+2]``, …) using the group oxidation state, bypassing
+        RDKit. This runs before the unsupported-element check. A declared charge
+        (`per_fragment_charges`, or `total_charge` for a lone atom) overrides the
+        default oxidation state. Multi-atom metal fragments and other metals are
+        not affected.
     split_fragments
         If True, split disconnected covalent components before assigning bond
         orders. This is recommended for XYZ files containing multiple molecules.
@@ -75,6 +111,9 @@ class PerceptionConfig:
     per_fragment_charges: tuple[int, ...] | None = None
     candidate_charges: tuple[int, ...] = (-3, -2, -1, 0, 1, 2, 3)
     charge_fallback: bool = False
+    restrict_to_supported_elements: bool = True
+    supported_elements: frozenset[str] | None = None
+    recover_ionic_metals: bool = True
     split_fragments: bool = True
     allow_charged_fragments: bool = True
     use_hueckel: bool = False
@@ -335,6 +374,40 @@ def _manual_components(atoms: Sequence[_AtomRow], cov_factor: float) -> list[tup
     return [tuple(v) for v in groups.values()]
 
 
+def _ionic_metal_oxidation_state(symbol: str) -> int | None:
+    """Default ionic oxidation state for a lone group 1/2 metal, else None."""
+    if symbol in ALKALI_METALS:
+        return 1
+    if symbol in ALKALINE_EARTH_METALS:
+        return 2
+    return None
+
+
+def _separate_ionic_metals(
+    frags: Sequence[Sequence[int]], atoms: Sequence[_AtomRow], config: PerceptionConfig
+) -> list[tuple[int, ...]]:
+    """Pull group 1/2 metal atoms out of covalent fragments into singletons.
+
+    Connectivity perception treats a short metal...ligand contact (a normal
+    ionic distance, ~1.6-2.5 A) as a covalent bond, merging an ionic counterion
+    into its anion. Alkali / alkaline-earth metals are ionic in these contexts,
+    so extract each into its own fragment; the fast-path then recovers it as an
+    ion and the remaining atoms perceive cleanly as the anion.
+    """
+    if not config.recover_ionic_metals:
+        return [tuple(frag) for frag in frags]
+    rest: list[tuple[int, ...]] = []
+    metal_singletons: list[tuple[int, ...]] = []
+    for frag in frags:
+        kept = tuple(i for i in frag if _ionic_metal_oxidation_state(atoms[i].symbol) is None)
+        if kept:
+            rest.append(kept)
+        metal_singletons.extend(
+            (i,) for i in frag if _ionic_metal_oxidation_state(atoms[i].symbol) is not None
+        )
+    return rest + metal_singletons
+
+
 def _split_components(
     block: str, atoms: Sequence[_AtomRow], config: PerceptionConfig
 ) -> tuple[list[tuple[int, ...]], list[str]]:
@@ -358,10 +431,12 @@ def _split_components(
         )
         frags = [tuple(int(i) for i in frag) for frag in Chem.GetMolFrags(mol, asMols=False)]
         if frags:
-            return frags, warnings
+            return _separate_ionic_metals(frags, atoms, config), warnings
     except Exception as exc:  # pragma: no cover - fallback path depends on RDKit build/inputs
         warnings.append(f"RDKit connectivity failed; used covalent-radius fallback: {exc}")
-    return _manual_components(atoms, config.cov_factor), warnings
+    return _separate_ionic_metals(
+        _manual_components(atoms, config.cov_factor), atoms, config
+    ), warnings
 
 
 def _fragment_xyz(
@@ -619,6 +694,94 @@ def _candidate_to_record(
     )
 
 
+def _unsupported_elements(elements: Sequence[str], config: PerceptionConfig) -> list[str]:
+    """Return the distinct elements RDKit cannot reliably perceive, in order."""
+    if not config.restrict_to_supported_elements:
+        return []
+    allowed = config.supported_elements or DEFAULT_SUPPORTED_ELEMENTS
+    unsupported: list[str] = []
+    for element in elements:
+        if element not in allowed and element not in unsupported:
+            unsupported.append(element)
+    return unsupported
+
+
+def _unsupported_record(
+    *,
+    source: str | None,
+    block_index: int,
+    molecule_index: int,
+    atom_indices: Sequence[int],
+    elements: Sequence[str],
+    unsupported: Sequence[str],
+    inherited_warnings: Sequence[str],
+) -> MoleculeRecord:
+    reason = (
+        "Contains element(s) RDKit bond perception cannot handle: "
+        f"{', '.join(unsupported)}. xyz2mol / DetermineBonds targets main-group "
+        "organics; metals and noble gases are not supported and would otherwise "
+        "be mis-assigned (e.g. a lone Na+ comes back as [NaH] at high confidence). "
+        "Set restrict_to_supported_elements=False to attempt perception anyway."
+    )
+    return MoleculeRecord(
+        source=source,
+        block_index=block_index,
+        molecule_index=molecule_index,
+        atom_indices=list(atom_indices),
+        elements=list(elements),
+        formula=None,
+        charge=None,
+        smiles=None,
+        explicit_h_smiles=None,
+        inchi=None,
+        inchikey=None,
+        confidence="none",
+        status="unsupported",
+        warnings=list(inherited_warnings),
+        errors=[reason],
+        alternates=[],
+        mol=None,
+    )
+
+
+def _metal_ion_candidate(atom: _AtomRow, charge: int, config: PerceptionConfig) -> _Candidate:
+    """Build a candidate for a single metal atom as its ion, bypassing RDKit perception."""
+    rwmol = Chem.RWMol()
+    rd_atom = Chem.Atom(atom.symbol)
+    rd_atom.SetFormalCharge(int(charge))
+    rd_atom.SetNoImplicit(True)
+    rwmol.AddAtom(rd_atom)
+    mol = rwmol.GetMol()
+    conformer = Chem.Conformer(mol.GetNumAtoms())
+    conformer.SetAtomPosition(0, Point3D(atom.x, atom.y, atom.z))
+    mol.AddConformer(conformer, assignId=True)
+    Chem.SanitizeMol(mol)
+    return _candidate_from_mol(mol, int(charge), config)
+
+
+def _maybe_ionic_metal_candidate(
+    atoms: Sequence[_AtomRow],
+    atom_indices: Sequence[int],
+    elements: Sequence[str],
+    config: PerceptionConfig,
+    n_fragments: int,
+    frag_index: int,
+) -> _Candidate | None:
+    """Return an ion candidate for a lone group 1/2 metal counterion, else None."""
+    if not config.recover_ionic_metals or len(atom_indices) != 1:
+        return None
+    oxidation_state = _ionic_metal_oxidation_state(elements[0])
+    if oxidation_state is None:
+        return None
+    if config.per_fragment_charges is not None:
+        charge = int(config.per_fragment_charges[frag_index])
+    elif config.total_charge is not None and n_fragments == 1:
+        charge = int(config.total_charge)
+    else:
+        charge = oxidation_state
+    return _metal_ion_candidate(atoms[atom_indices[0]], charge, config)
+
+
 def _combine_scores(
     a: tuple[int | float, ...], b: tuple[int | float, ...]
 ) -> tuple[int | float, ...]:
@@ -674,6 +837,7 @@ def recover_xyz_block(
     candidate_sets: list[list[_Candidate]] = []
     error_sets: list[list[str]] = []
     element_sets: list[list[str]] = []
+    unsupported_sets: list[list[str]] = []
     fragment_blocks: list[str] = []
     for frag_idx, atom_indices in enumerate(component_indices):
         frag_block, elements = _fragment_xyz(
@@ -681,6 +845,28 @@ def recover_xyz_block(
             atom_indices,
             comment=f"{source or 'xyz'} block={block_index} fragment={frag_idx}",
         )
+        element_sets.append(elements)
+        fragment_blocks.append(frag_block)
+
+        ion_candidate = _maybe_ionic_metal_candidate(
+            atoms, atom_indices, elements, config, n_fragments, frag_idx
+        )
+        if ion_candidate is not None:
+            # Lone group 1/2 metal counterion: recover the ion directly.
+            candidate_sets.append([ion_candidate])
+            error_sets.append([])
+            unsupported_sets.append([])
+            continue
+
+        unsupported = _unsupported_elements(elements, config)
+        unsupported_sets.append(unsupported)
+        if unsupported:
+            # Skip perception entirely: RDKit would either raise or, worse,
+            # return a confidently wrong structure for these elements.
+            candidate_sets.append([])
+            error_sets.append([])
+            continue
+
         charges = _charges_for_fragment(config, n_fragments, frag_idx)
         candidates, errors = _perceive_candidates(frag_block, charges, config)
         if not candidates and config.charge_fallback:
@@ -697,8 +883,6 @@ def recover_xyz_block(
                     )
         candidate_sets.append(candidates)
         error_sets.append(errors)
-        element_sets.append(elements)
-        fragment_blocks.append(frag_block)
 
     chosen: list[_Candidate | None]
     charge_constrained = config.total_charge is not None or config.per_fragment_charges is not None
@@ -722,6 +906,19 @@ def recover_xyz_block(
 
     records: list[MoleculeRecord] = []
     for frag_idx, atom_indices in enumerate(component_indices):
+        if unsupported_sets[frag_idx]:
+            records.append(
+                _unsupported_record(
+                    source=source,
+                    block_index=block_index,
+                    molecule_index=frag_idx,
+                    atom_indices=atom_indices,
+                    elements=element_sets[frag_idx],
+                    unsupported=unsupported_sets[frag_idx],
+                    inherited_warnings=split_warnings,
+                )
+            )
+            continue
         records.append(
             _candidate_to_record(
                 chosen[frag_idx],

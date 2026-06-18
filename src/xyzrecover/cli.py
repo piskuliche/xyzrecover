@@ -73,6 +73,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-sanitize", action="store_true", help="Do not run RDKit sanitization on candidates"
     )
     parser.add_argument(
+        "--no-element-check",
+        action="store_true",
+        help="Attempt perception even for elements RDKit cannot handle (metals, "
+        "noble gases); by default these are reported as status='unsupported'",
+    )
+    parser.add_argument(
+        "--no-ionic-metals",
+        action="store_true",
+        help="Do not recover lone group 1/2 metal counterions as their ion "
+        "([Na+], [Ca+2], ...); report them as status='unsupported' instead",
+    )
+    parser.add_argument(
         "--keep-explicit-h-smiles",
         action="store_true",
         help="Use explicit-H SMILES as the primary SMILES",
@@ -103,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         cov_factor=args.cov_factor,
         embed_chiral=not args.no_chiral,
         sanitize=not args.no_sanitize,
+        restrict_to_supported_elements=not args.no_element_check,
+        recover_ionic_metals=not args.no_ionic_metals,
         keep_explicit_h_smiles=args.keep_explicit_h_smiles,
         max_iterations=args.max_iterations,
     )

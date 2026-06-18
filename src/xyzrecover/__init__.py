@@ -1,6 +1,7 @@
 """Recover molecular identifiers from XYZ coordinate files using RDKit."""
 
 from .core import (
+    DEFAULT_SUPPORTED_ELEMENTS,
     MoleculeRecord,
     PerceptionConfig,
     XyzRecoverError,
@@ -14,6 +15,7 @@ from .core import (
 )
 
 __all__ = [
+    "DEFAULT_SUPPORTED_ELEMENTS",
     "PerceptionConfig",
     "MoleculeRecord",
     "XyzRecoverError",
