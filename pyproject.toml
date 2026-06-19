@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "Recover RDKit molecules, charges, SMILES, InChI, and InChIKey from XYZ coordinates with candidate charge inference."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{email = "piskulichz@gmail.com"}]
 dependencies = [
   "rdkit>=2022.9"
 ]
 keywords = ["rdkit", "xyz", "smiles", "inchi", "chemistry", "bond perception"]
 classifiers = [
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
