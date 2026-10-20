@@ -80,6 +80,17 @@ class PerceptionConfig:
         (`per_fragment_charges`, or `total_charge` for a lone atom) overrides the
         default oxidation state. Multi-atom metal fragments and other metals are
         not affected.
+    fix_nitro_groups
+        If True (default), each nitro-type group (an N with three bonds, two of
+        them to terminal O atoms: nitro, nitrate, nitramine) is assigned the
+        charge-separated ``[N+](=O)[O-]`` form, and RDKit assigns bond orders
+        only to the rest of the component, with the group replaced by a neutral
+        monovalent stand-in. Without this, RDKit's xyz2mol tends to return
+        ``N([O-])[O-]`` balanced by invented charges elsewhere (``[O+]``,
+        ``[S+]``), or to fail outright, depending on atom order. Only applies
+        when `allow_charged_fragments` is True. Nitronate anions come out as
+        the carbanion resonance form (``[CH2-][N+](=O)[O-]``), which has the
+        same InChI.
     split_fragments
         If True, split disconnected covalent components before assigning bond
         orders. This is recommended for XYZ files containing multiple molecules.
@@ -114,6 +125,7 @@ class PerceptionConfig:
     restrict_to_supported_elements: bool = True
     supported_elements: frozenset[str] | None = None
     recover_ionic_metals: bool = True
+    fix_nitro_groups: bool = True
     split_fragments: bool = True
     allow_charged_fragments: bool = True
     use_hueckel: bool = False
@@ -486,6 +498,117 @@ def _safe_remove_hs(mol: Chem.Mol) -> Chem.Mol:
             return Chem.Mol(mol)
 
 
+def _nitro_groups(mol: Chem.Mol) -> list[tuple[int, int, int]]:
+    """Find nitro-type groups as ``(n, o_double, o_single)`` atom indices.
+
+    A nitro-type group is an N with three bonds, at least two of them to
+    terminal O atoms (nitro, nitrate, nitramine). The two lowest-index terminal
+    O atoms are used, so the assignment is deterministic.
+    """
+    groups: list[tuple[int, int, int]] = []
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() != 7 or atom.GetDegree() != 3:
+            continue
+        terminal_o = sorted(
+            nbr.GetIdx()
+            for nbr in atom.GetNeighbors()
+            if nbr.GetAtomicNum() == 8 and nbr.GetDegree() == 1
+        )
+        if len(terminal_o) >= 2:
+            groups.append((atom.GetIdx(), terminal_o[0], terminal_o[1]))
+    return groups
+
+
+def _bond_orders_with_nitro_placeholders(
+    mol: Chem.Mol,
+    groups: Sequence[tuple[int, int, int]],
+    charge: int,
+    config: PerceptionConfig,
+) -> Chem.Mol:
+    """Assign bond orders to a connected `mol` with each nitro group as ``[N+](=O)[O-]``.
+
+    RDKit's xyz2mol tries nitrogen at valence 3 before 4 and keeps the first
+    charge-balanced assignment, so a nitro N tends to come out as N([O-])[O-]
+    with the -2 offset by charges invented elsewhere. A charge-bookkeeping
+    quirk for three-bonded carbons can also make it abort the search, which
+    depends on atom order. A nitro group is net-neutral and singly bonded to
+    its parent, so perceive the rest of the component with the group replaced
+    by a neutral F, then write the nitro group back.
+    """
+    removed = {o for _, o_double, o_single in groups for o in (o_double, o_single)}
+    kept = [i for i in range(mol.GetNumAtoms()) if i not in removed]
+
+    work = Chem.RWMol(mol)
+    # Hueckel connectivity leaves the total charge on atom 0; start clean.
+    for atom in work.GetAtoms():
+        atom.SetFormalCharge(0)
+    for n, _, _ in groups:
+        work.GetAtomWithIdx(n).SetAtomicNum(9)
+    for idx in sorted(removed, reverse=True):
+        work.RemoveAtom(idx)
+    work_mol = work.GetMol()
+    rdDetermineBonds.DetermineBondOrders(
+        work_mol,
+        charge=int(charge),
+        allowChargedFragments=config.allow_charged_fragments,
+        embedChiral=False,
+        useAtomMap=False,
+        maxIterations=int(config.max_iterations),
+    )
+
+    out = Chem.RWMol(mol)
+    for atom in out.GetAtoms():
+        atom.SetFormalCharge(0)
+    for bond in work_mol.GetBonds():
+        out.GetBondBetweenAtoms(
+            kept[bond.GetBeginAtomIdx()], kept[bond.GetEndAtomIdx()]
+        ).SetBondType(bond.GetBondType())
+    for atom in work_mol.GetAtoms():
+        target = out.GetAtomWithIdx(kept[atom.GetIdx()])
+        target.SetFormalCharge(atom.GetFormalCharge())
+        target.SetNumRadicalElectrons(atom.GetNumRadicalElectrons())
+    for n, o_double, o_single in groups:
+        out.GetAtomWithIdx(n).SetFormalCharge(1)
+        out.GetAtomWithIdx(o_single).SetFormalCharge(-1)
+        out.GetBondBetweenAtoms(n, o_double).SetBondType(Chem.BondType.DOUBLE)
+    result = out.GetMol()
+    if config.embed_chiral:
+        # Same steps DetermineBondOrders runs for embedChiral=True.
+        Chem.SanitizeMol(result)
+        Chem.SetDoubleBondNeighborDirections(result, result.GetConformer())
+        Chem.AssignStereochemistryFrom3D(result)
+    return result
+
+
+def _determine_bonds(
+    mol: Chem.Mol, charge: int, use_hueckel: bool, config: PerceptionConfig
+) -> Chem.Mol:
+    """``rdDetermineBonds.DetermineBonds``, with nitro groups fixed before bond orders."""
+    if mol.GetNumAtoms() <= 1:
+        # DetermineBonds leaves a single atom untouched.
+        return mol
+    rdDetermineBonds.DetermineConnectivity(
+        mol,
+        useHueckel=use_hueckel,
+        charge=int(charge),
+        covFactor=config.cov_factor,
+        useVdw=config.use_vdw,
+    )
+    if config.fix_nitro_groups and config.allow_charged_fragments:
+        groups = _nitro_groups(mol)
+        if groups:
+            return _bond_orders_with_nitro_placeholders(mol, groups, charge, config)
+    rdDetermineBonds.DetermineBondOrders(
+        mol,
+        charge=int(charge),
+        allowChargedFragments=config.allow_charged_fragments,
+        embedChiral=config.embed_chiral,
+        useAtomMap=False,
+        maxIterations=int(config.max_iterations),
+    )
+    return mol
+
+
 def _candidate_from_mol(mol: Chem.Mol, charge: int, config: PerceptionConfig) -> _Candidate:
     warnings: list[str] = []
     formula: str | None = None
@@ -568,17 +691,7 @@ def _perceive_candidates(
     for charge in charges:
         mol = _mol_from_xyz_block(fragment_block)
         try:
-            rdDetermineBonds.DetermineBonds(
-                mol,
-                useHueckel=use_hueckel,
-                charge=int(charge),
-                covFactor=config.cov_factor,
-                allowChargedFragments=config.allow_charged_fragments,
-                embedChiral=config.embed_chiral,
-                useAtomMap=False,
-                useVdw=config.use_vdw,
-                maxIterations=int(config.max_iterations),
-            )
+            mol = _determine_bonds(mol, int(charge), use_hueckel, config)
             if config.sanitize:
                 Chem.SanitizeMol(mol)
             if mol.GetNumConformers():

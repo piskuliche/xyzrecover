@@ -85,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
         "([Na+], [Ca+2], ...); report them as status='unsupported' instead",
     )
     parser.add_argument(
+        "--no-nitro-fix",
+        action="store_true",
+        help="Do not pre-assign nitro groups as [N+](=O)[O-]; leave them to RDKit, "
+        "which often returns N([O-])[O-] with compensating charges elsewhere",
+    )
+    parser.add_argument(
         "--keep-explicit-h-smiles",
         action="store_true",
         help="Use explicit-H SMILES as the primary SMILES",
@@ -117,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         sanitize=not args.no_sanitize,
         restrict_to_supported_elements=not args.no_element_check,
         recover_ionic_metals=not args.no_ionic_metals,
+        fix_nitro_groups=not args.no_nitro_fix,
         keep_explicit_h_smiles=args.keep_explicit_h_smiles,
         max_iterations=args.max_iterations,
     )

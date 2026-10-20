@@ -28,6 +28,17 @@ is on by default; disable with `recover_ionic_metals=False` (CLI:
 `--no-ionic-metals`). Transition metals and multi-atom metal fragments are still
 reported `unsupported`.
 
+**Nitro groups** are fixed before bond orders are assigned. Left to itself,
+RDKit's xyz2mol often returns a nitro group as `N([O-])[O-]`, offset by charges
+it invents elsewhere (`[O+]`, `[S+]`), or fails outright, depending on the atom
+order. Any N with three bonds, two of them to terminal O atoms (nitro, nitrate,
+nitramine), is therefore assigned `[N+](=O)[O-]`, and RDKit perceives the rest
+of the component with the group replaced by a neutral stand-in. Nitronate
+anions come out as the carbanion resonance form (`[CH2-][N+](=O)[O-]`), which
+has the same InChI. This is on by default (only with charged fragments, not
+`--radicals-instead-of-charges`); disable with `fix_nitro_groups=False` (CLI:
+`--no-nitro-fix`).
+
 ## Install
 
 ```bash
