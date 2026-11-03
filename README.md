@@ -120,8 +120,8 @@ xyzrecover molecule.xyz --use-hueckel --total-charge 1
 from xyzrecover import PerceptionConfig, recover_xyz_file, records_to_json
 
 config = PerceptionConfig(
-    total_charge=-1,                  # optional but recommended when known
-    candidate_charges=(-2, -1, 0, 1), # used when fragment charge is unknown
+    total_charge=-1,  # optional but recommended when known
+    candidate_charges=(-2, -1, 0, 1),  # used when fragment charge is unknown
     split_fragments=True,
 )
 
