@@ -39,6 +39,19 @@ has the same InChI. This is on by default (only with charged fragments, not
 `--radicals-instead-of-charges`); disable with `fix_nitro_groups=False` (CLI:
 `--no-nitro-fix`).
 
+**Isolated hydrogens are rejected.** In sampled geometries (normal-mode or MD),
+an X–H bond can be stretched past the connectivity cutoff, leaving a hydrogen
+with no bonded neighbour. Bond-order assignment would then balance it as a free
+`[H+]` against a carbanion or alkoxide (`C[O-].[H+]` for a stretched methanol),
+and a declared `total_charge` would accept that at `high` confidence. So when
+connectivity leaves any hydrogen unbonded in a block of more than one atom,
+every component of the block is reported with `status="failed"` and an error
+naming the hydrogen's atom index. Try another frame of the same molecule
+instead. The hydrogen is not reattached to its nearest heavy atom, because that
+would silently mis-assign real proton-transfer geometries. `H2` and a lone-H
+block are unaffected. This is on by default; disable with
+`reject_isolated_hydrogens=False` (CLI: `--allow-isolated-hydrogens`).
+
 ## Install
 
 ```bash

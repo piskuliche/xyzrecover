@@ -91,6 +91,19 @@ class PerceptionConfig:
         when `allow_charged_fragments` is True. Nitronate anions come out as
         the carbanion resonance form (``[CH2-][N+](=O)[O-]``), which has the
         same InChI.
+    reject_isolated_hydrogens
+        If True (default), a block of more than one atom in which connectivity
+        perception leaves any hydrogen with no bonded neighbour is reported as
+        failed (``status="failed"``, ``smiles=None``) for every component, with
+        an error naming the hydrogen's atom index. Such a hydrogen is almost
+        always an X-H bond stretched past the connectivity cutoff (normal-mode
+        or MD sampling). Left alone, bond-order assignment balances it as a
+        free ``[H+]`` against a carbanion or alkoxide, which a declared total
+        charge then accepts at high confidence. The record is failed rather
+        than repaired, because reattaching the hydrogen to its nearest heavy
+        atom would silently mis-assign real proton-transfer geometries; try
+        another conformer instead. ``H2`` and a single-atom block are not
+        affected.
     split_fragments
         If True, split disconnected covalent components before assigning bond
         orders. This is recommended for XYZ files containing multiple molecules.
@@ -126,6 +139,7 @@ class PerceptionConfig:
     supported_elements: frozenset[str] | None = None
     recover_ionic_metals: bool = True
     fix_nitro_groups: bool = True
+    reject_isolated_hydrogens: bool = True
     split_fragments: bool = True
     allow_charged_fragments: bool = True
     use_hueckel: bool = False
@@ -449,6 +463,37 @@ def _split_components(
     return _separate_ionic_metals(
         _manual_components(atoms, config.cov_factor), atoms, config
     ), warnings
+
+
+def _isolated_hydrogens(
+    block: str, atoms: Sequence[_AtomRow], config: PerceptionConfig
+) -> list[int]:
+    """Indices of hydrogen atoms that connectivity perception leaves unbonded.
+
+    Uses the same connectivity call (and covalent-radius fallback) as fragment
+    splitting, on the whole block, so the answer does not depend on
+    `split_fragments`. A single-atom block has no isolated hydrogen by definition.
+    """
+    if len(atoms) < 2 or not any(atom.symbol == "H" for atom in atoms):
+        return []
+    use_hueckel = config.use_hueckel and rdDetermineBonds.hueckelEnabled()
+    try:
+        mol = _mol_from_xyz_block(block)
+        rdDetermineBonds.DetermineConnectivity(
+            mol,
+            useHueckel=use_hueckel,
+            charge=config.total_charge or 0,
+            covFactor=config.cov_factor,
+            useVdw=config.use_vdw,
+        )
+        bonded = [atom.GetDegree() > 0 for atom in mol.GetAtoms()]
+    except Exception:  # pragma: no cover - fallback path depends on RDKit build/inputs
+        bonded = [False] * len(atoms)
+        for component in _manual_components(atoms, config.cov_factor):
+            if len(component) > 1:
+                for idx in component:
+                    bonded[idx] = True
+    return [i for i, atom in enumerate(atoms) if atom.symbol == "H" and not bonded[i]]
 
 
 def _fragment_xyz(
@@ -946,6 +991,32 @@ def recover_xyz_block(
         raise XyzRecoverError(
             f"per_fragment_charges has {len(config.per_fragment_charges)} entries but the XYZ block has {n_fragments} disconnected components"
         )
+
+    if config.reject_isolated_hydrogens:
+        isolated = _isolated_hydrogens(normal_block, atoms, config)
+        if isolated:
+            reason = (
+                f"Hydrogen atom(s) {isolated} have no bonded neighbour (an X-H bond "
+                "stretched past the connectivity cutoff?); bond-order assignment would "
+                "report them as free [H+]/[H-]. Rejected; try another conformer, or set "
+                "reject_isolated_hydrogens=False."
+            )
+            return [
+                _candidate_to_record(
+                    None,
+                    source=source,
+                    block_index=block_index,
+                    molecule_index=frag_idx,
+                    atom_indices=atom_indices,
+                    elements=[atoms[i].symbol for i in atom_indices],
+                    candidates=[],
+                    errors=[reason],
+                    inherited_warnings=split_warnings,
+                    charge_constrained=False,
+                    config=config,
+                )
+                for frag_idx, atom_indices in enumerate(component_indices)
+            ]
 
     candidate_sets: list[list[_Candidate]] = []
     error_sets: list[list[str]] = []
