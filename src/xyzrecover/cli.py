@@ -91,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
         "which often returns N([O-])[O-] with compensating charges elsewhere",
     )
     parser.add_argument(
+        "--allow-isolated-hydrogens",
+        action="store_true",
+        help="Perceive blocks in which a hydrogen has no bonded neighbour; by default "
+        "these are reported as status='failed' instead of returning a free [H+]",
+    )
+    parser.add_argument(
         "--keep-explicit-h-smiles",
         action="store_true",
         help="Use explicit-H SMILES as the primary SMILES",
@@ -124,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         restrict_to_supported_elements=not args.no_element_check,
         recover_ionic_metals=not args.no_ionic_metals,
         fix_nitro_groups=not args.no_nitro_fix,
+        reject_isolated_hydrogens=not args.allow_isolated_hydrogens,
         keep_explicit_h_smiles=args.keep_explicit_h_smiles,
         max_iterations=args.max_iterations,
     )
