@@ -630,8 +630,16 @@ def _determine_bonds(
 ) -> Chem.Mol:
     """``rdDetermineBonds.DetermineBonds``, with nitro groups fixed before bond orders."""
     if mol.GetNumAtoms() <= 1:
-        # DetermineBonds leaves a single atom untouched.
-        return mol
+        # DetermineBonds leaves a single atom untouched: it ignores the requested
+        # charge, and sanitizing then fills the valence with implicit hydrogens
+        # (a lone Cl came back as HCl, and NaI as "I.[Na+]"). A lone atom has no
+        # hydrogens to add, so it is the bare atom at the requested charge.
+        rwmol = Chem.RWMol(mol)
+        for atom in rwmol.GetAtoms():
+            atom.SetFormalCharge(int(charge))
+            atom.SetNoImplicit(True)
+            atom.SetNumExplicitHs(0)
+        return rwmol.GetMol()
     rdDetermineBonds.DetermineConnectivity(
         mol,
         useHueckel=use_hueckel,
@@ -940,6 +948,148 @@ def _maybe_ionic_metal_candidate(
     return _metal_ion_candidate(atoms[atom_indices[0]], charge, config)
 
 
+def _with_ions(
+    cand: _Candidate, ions: Sequence[_Candidate], config: PerceptionConfig
+) -> _Candidate:
+    """Merge metal-ion candidates into a candidate for the rest of the block."""
+    mol = cand.mol
+    for ion in ions:
+        mol = Chem.CombineMols(mol, ion.mol)
+    combined = _candidate_from_mol(mol, cand.charge + sum(ion.charge for ion in ions), config)
+    combined.warnings[:0] = cand.warnings
+    return combined
+
+
+def _recover_whole_with_ionic_metals(
+    atoms: Sequence[_AtomRow],
+    config: PerceptionConfig,
+    *,
+    source: str | None,
+    block_index: int,
+    inherited_warnings: Sequence[str],
+) -> list[MoleculeRecord] | None:
+    """Whole-block perception of a block holding group 1/2 metal counterions.
+
+    With ``split_fragments=False`` the block is a single component, so the ionic
+    fast-path (which acts on lone-atom fragments) never sees a salt's metal, and
+    the block was reported ``unsupported``. Here each group 1/2 metal atom is
+    taken out as its ion, the remaining atoms are perceived as ONE component at
+    ``total_charge`` minus the ions' charges, and the ions are merged back in,
+    so the block still yields a single record with one SMILES and one InChIKey
+    for the whole salt (e.g. ``[I-].[Na+]``).
+
+    Returns ``None`` when this path does not apply: fragments are split,
+    ``recover_ionic_metals`` is off, ``per_fragment_charges`` is given (the
+    caller has fixed the component layout), or the block has no group 1/2 metal
+    or nothing but metals.
+    """
+    if config.split_fragments or not config.recover_ionic_metals:
+        return None
+    if config.per_fragment_charges is not None:
+        return None
+    metal_idx = tuple(
+        i for i, atom in enumerate(atoms) if _ionic_metal_oxidation_state(atom.symbol) is not None
+    )
+    rest_idx = tuple(
+        i for i, atom in enumerate(atoms) if _ionic_metal_oxidation_state(atom.symbol) is None
+    )
+    if not metal_idx or not rest_idx:
+        return None
+
+    all_idx = rest_idx + metal_idx
+    elements = [atoms[i].symbol for i in all_idx]
+    ions = [
+        _metal_ion_candidate(atoms[i], _ionic_metal_oxidation_state(atoms[i].symbol) or 0, config)
+        for i in metal_idx
+    ]
+    ion_charge = sum(ion.charge for ion in ions)
+
+    def failed(errors: Sequence[str]) -> list[MoleculeRecord]:
+        return [
+            _candidate_to_record(
+                None,
+                source=source,
+                block_index=block_index,
+                molecule_index=0,
+                atom_indices=all_idx,
+                elements=elements,
+                candidates=[],
+                errors=errors,
+                inherited_warnings=inherited_warnings,
+                charge_constrained=False,
+                config=config,
+            )
+        ]
+
+    rest_block, rest_elements = _fragment_xyz(
+        atoms, rest_idx, comment=f"{source or 'xyz'} block={block_index} without ionic metals"
+    )
+    unsupported = _unsupported_elements(rest_elements, config)
+    if unsupported:
+        return [
+            _unsupported_record(
+                source=source,
+                block_index=block_index,
+                molecule_index=0,
+                atom_indices=all_idx,
+                elements=elements,
+                unsupported=unsupported,
+                inherited_warnings=inherited_warnings,
+            )
+        ]
+
+    # A hydrogen whose only contact was the metal is free once the metal is
+    # removed; reject it as the whole-block check does, or it comes back as [H+].
+    if config.reject_isolated_hydrogens:
+        isolated = _isolated_hydrogens(rest_block, [atoms[i] for i in rest_idx], config)
+        if isolated:
+            return failed(
+                [
+                    f"Hydrogen atom(s) {[rest_idx[k] for k in isolated]} have no bonded "
+                    "neighbour other than a group 1/2 metal; bond-order assignment would "
+                    "report them as free [H+]/[H-]. Rejected; try another conformer, or "
+                    "set reject_isolated_hydrogens=False."
+                ]
+            )
+
+    if config.total_charge is not None:
+        charges: tuple[int, ...] = (int(config.total_charge) - ion_charge,)
+    else:
+        charges = _charge_search_order(config.candidate_charges)
+    candidates, errors = _perceive_candidates(rest_block, charges, config)
+    if not candidates and config.charge_fallback:
+        extra_charges = tuple(
+            c for c in _charge_search_order(config.candidate_charges) if c not in charges
+        )
+        if extra_charges:
+            candidates, fb_errors = _perceive_candidates(rest_block, extra_charges, config)
+            errors = list(errors) + fb_errors
+            for cand in candidates:
+                cand.warnings.append(
+                    "Charge-constrained perception failed; recovered using "
+                    "candidate_charges fallback."
+                )
+    if not candidates:
+        return failed(errors)
+
+    combined = [_with_ions(cand, ions, config) for cand in candidates]
+    return [
+        _candidate_to_record(
+            combined[0],
+            source=source,
+            block_index=block_index,
+            molecule_index=0,
+            atom_indices=all_idx,
+            elements=elements,
+            candidates=combined,
+            errors=errors,
+            inherited_warnings=inherited_warnings,
+            charge_constrained=config.total_charge is not None,
+            config=config,
+        )
+    ]
+
+
 def _combine_scores(
     a: tuple[int | float, ...], b: tuple[int | float, ...]
 ) -> tuple[int | float, ...]:
@@ -1017,6 +1167,16 @@ def recover_xyz_block(
                 )
                 for frag_idx, atom_indices in enumerate(component_indices)
             ]
+
+    whole_with_ions = _recover_whole_with_ionic_metals(
+        atoms,
+        config,
+        source=source,
+        block_index=block_index,
+        inherited_warnings=split_warnings,
+    )
+    if whole_with_ions is not None:
+        return whole_with_ions
 
     candidate_sets: list[list[_Candidate]] = []
     error_sets: list[list[str]] = []

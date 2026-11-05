@@ -83,13 +83,24 @@ def test_transition_metal_lone_atom_is_unsupported(sym):
     assert rec.smiles is None
 
 
-def test_multiatom_metal_fragment_is_unsupported():
-    # NaCl as a single bonded fragment is not a lone ion.
+def test_multiatom_metal_fragment_is_unsupported_without_ionic_recovery():
+    # With the ionic fast-path off, NaCl perceived whole is not a lone ion and
+    # stays guarded. (With it on, see test_ionic_whole_mode.py.)
     rec = recover_xyz_text(
-        "2\nnacl\nNa 0 0 0\nCl 0 0 2.36\n", PerceptionConfig(split_fragments=False)
+        "2\nnacl\nNa 0 0 0\nCl 0 0 2.36\n",
+        PerceptionConfig(split_fragments=False, recover_ionic_metals=False),
     )[0]
     assert rec.status == "unsupported"
     assert "Na" in rec.elements
+
+
+def test_metal_only_block_is_unsupported_in_whole_mode():
+    # Nothing but metal atoms: no anion to perceive, so the whole-mode ionic
+    # path does not apply and the guard still reports it.
+    rec = recover_xyz_text(
+        "2\nna2\nNa 0 0 0\nNa 0 0 3.0\n", PerceptionConfig(split_fragments=False)
+    )[0]
+    assert rec.status == "unsupported"
 
 
 def test_old_perception_path_when_both_disabled():

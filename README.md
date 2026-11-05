@@ -23,10 +23,19 @@ metal atom (Na, K, Li, Ca, Mg, …) is recovered directly as its ion (`[Na+]`,
 `[Ca+2]`) using the group oxidation state, bypassing RDKit. Such atoms are split
 out of any short ionic contact first, so a salt like Na⁺·methyl-phosphate⁻
 recovers the metal as `[Na+]` and perceives the anion separately, and (when you
-pass `total_charge`) the charge is balanced across the ion and the anion. This
-is on by default; disable with `recover_ionic_metals=False` (CLI:
-`--no-ionic-metals`). Transition metals and multi-atom metal fragments are still
-reported `unsupported`.
+pass `total_charge`) the charge is balanced across the ion and the anion. With
+`split_fragments=False` the metals are taken out the same way, the rest of the
+block is perceived as one component at `total_charge` minus the ions' charges,
+and the ions are merged back, so the block still gives one record with one
+SMILES and InChIKey for the whole salt (`[I-].[Na+]`, `CC(=O)[O-].[Na+]`). A
+hydrogen whose only contact was the metal is rejected, as an isolated hydrogen.
+This is on by default; disable with `recover_ionic_metals=False` (CLI:
+`--no-ionic-metals`). Transition metals and blocks made only of metal atoms are
+still reported `unsupported`.
+
+A **single-atom** component is the bare atom at the requested charge, with no
+implicit hydrogens: a lone Cl at charge -1 is `[Cl-]` (before 0.3.1 it came
+back as `Cl`, i.e. HCl, whatever the charge).
 
 **Nitro groups** are fixed before bond orders are assigned. Left to itself,
 RDKit's xyz2mol often returns a nitro group as `N([O-])[O-]`, offset by charges
@@ -173,7 +182,7 @@ complexes):
 | Neutral H-bonded complexes | ~100% (matches OpenBabel) | `high` | Use `split_fragments=True` (default). |
 | Proton-transfer / ion-pair complexes | recovered | `medium` | Genuinely ambiguous (where is the proton?); ≥ OpenBabel. Gate on confidence and inspect `alternates`. |
 | Charged organic ions, charge unknown | ~86% | lower | Declare the charge (`--total-charge`) to push to `high`; otherwise gate. |
-| Group 1/2 metal counterions (Na, K, Li, Ca, Mg) | lone ions recovered | `high` | Recovered as `[Na+]`/`[Ca+2]` via the ionic fast-path; pass `total_charge` to balance the anion. |
+| Group 1/2 metal counterions (Na, K, Li, Ca, Mg) | lone ions recovered | `high` | Recovered as `[Na+]`/`[Ca+2]` via the ionic fast-path, split or whole; pass `total_charge` to balance the anion. |
 | Transition metals / multi-atom metal fragments | not supported | `none` | Reported as `status="unsupported"`, `smiles=None`. Use a metal-aware tool (e.g. xyz2mol_tm, xtb WBO). |
 
 Practical gating rule: auto-accept `status="ok"` with `confidence="high"` and
